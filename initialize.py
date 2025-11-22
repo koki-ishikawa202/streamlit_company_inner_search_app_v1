@@ -110,10 +110,15 @@ def initialize_retriever():
         return
     
     # RAGの参照先となるデータソースの読み込み
-    docs_all = load_data_sources()
+    docs_all, csv_docs = load_data_sources()
 
     # OSがWindowsの場合、Unicode正規化と、cp932（Windows用の文字コード）で表現できない文字を除去
     for doc in docs_all:
+        doc.page_content = adjust_string(doc.page_content)
+        for key in doc.metadata:
+            doc.metadata[key] = adjust_string(doc.metadata[key])
+    
+    for doc in csv_docs:
         doc.page_content = adjust_string(doc.page_content)
         for key in doc.metadata:
             doc.metadata[key] = adjust_string(doc.metadata[key])
@@ -123,19 +128,30 @@ def initialize_retriever():
     
     # チャンク分割用のオブジェクトを作成
     text_splitter = CharacterTextSplitter(
-        chunk_size=500,
-        chunk_overlap=50,
+        chunk_size=ct.RAG_CHUNK_SIZE,
+        chunk_overlap=ct.RAG_CHUNK_OVERLAP,
         separator="\n"
     )
 
-    # チャンク分割を実施
+    # CSV以外のドキュメントはチャンク分割を実施
     splitted_docs = text_splitter.split_documents(docs_all)
+    
+    # CSVドキュメントは分割せずにそのまま追加
+    splitted_docs.extend(csv_docs)
 
-    # ベクターストアの作成
-    db = Chroma.from_documents(splitted_docs, embedding=embeddings)
+    # ベクターストアの作成（永続化ディレクトリを指定）
+    persist_directory = "./chroma_db"
+    db = Chroma.from_documents(
+        splitted_docs, 
+        embedding=embeddings,
+        persist_directory=persist_directory
+    )
 
+    # データベース自体もセッション状態に保存
+    st.session_state.vector_db = db
+    
     # ベクターストアを検索するRetrieverの作成
-    st.session_state.retriever = db.as_retriever(search_kwargs={"k": 3})
+    st.session_state.retriever = db.as_retriever(search_kwargs={"k": ct.RAG_RETRIEVAL_COUNT})
 
 
 def initialize_session_state():
@@ -154,12 +170,13 @@ def load_data_sources():
     RAGの参照先となるデータソースの読み込み
 
     Returns:
-        読み込んだ通常データソース
+        (通常データソース, CSVデータソース)のタプル
     """
     # データソースを格納する用のリスト
     docs_all = []
+    csv_docs = []
     # ファイル読み込みの実行（渡した各リストにデータが格納される）
-    recursive_file_check(ct.RAG_TOP_FOLDER_PATH, docs_all)
+    recursive_file_check(ct.RAG_TOP_FOLDER_PATH, docs_all, csv_docs)
 
     web_docs_all = []
     # ファイルとは別に、指定のWebページ内のデータも読み込み
@@ -173,16 +190,17 @@ def load_data_sources():
     # 通常読み込みのデータソースにWebページのデータを追加
     docs_all.extend(web_docs_all)
 
-    return docs_all
+    return docs_all, csv_docs
 
 
-def recursive_file_check(path, docs_all):
+def recursive_file_check(path, docs_all, csv_docs):
     """
     RAGの参照先となるデータソースの読み込み
 
     Args:
         path: 読み込み対象のファイル/フォルダのパス
         docs_all: データソースを格納する用のリスト
+        csv_docs: CSVデータソースを格納する用のリスト
     """
     # パスがフォルダかどうかを確認
     if os.path.isdir(path):
@@ -193,19 +211,48 @@ def recursive_file_check(path, docs_all):
             # ファイル/フォルダ名だけでなく、フルパスを取得
             full_path = os.path.join(path, file)
             # フルパスを渡し、再帰的にファイル読み込みの関数を実行
-            recursive_file_check(full_path, docs_all)
+            recursive_file_check(full_path, docs_all, csv_docs)
     else:
         # パスがファイルの場合、ファイル読み込み
-        file_load(path, docs_all)
+        file_load(path, docs_all, csv_docs)
 
 
-def file_load(path, docs_all):
+def load_csv_as_single_document(path):
+    """
+    CSVファイル全体を1つのドキュメントとして読み込む
+    
+    Args:
+        path: CSVファイルのパス
+    
+    Returns:
+        CSVファイル全体を含むDocumentオブジェクトのリスト
+    """
+    from langchain.schema import Document
+    import pandas as pd
+    
+    # pandasでCSVを読み込み
+    df = pd.read_csv(path, encoding='utf-8')
+    
+    # DataFrameをMarkdown形式の表に変換（LLMが読みやすい形式）
+    csv_content = df.to_markdown(index=False)
+    
+    # 1つのDocumentオブジェクトとして返す
+    doc = Document(
+        page_content=csv_content,
+        metadata={"source": path}
+    )
+    
+    return [doc]
+
+
+def file_load(path, docs_all, csv_docs):
     """
     ファイル内のデータ読み込み
 
     Args:
         path: ファイルパス
         docs_all: データソースを格納する用のリスト
+        csv_docs: CSVデータソースを格納する用のリスト
     """
     # ファイルの拡張子を取得
     file_extension = os.path.splitext(path)[1]
@@ -214,10 +261,15 @@ def file_load(path, docs_all):
 
     # 想定していたファイル形式の場合のみ読み込む
     if file_extension in ct.SUPPORTED_EXTENSIONS:
-        # ファイルの拡張子に合ったdata loaderを使ってデータ読み込み
-        loader = ct.SUPPORTED_EXTENSIONS[file_extension](path)
-        docs = loader.load()
-        docs_all.extend(docs)
+        # CSVファイルの場合は専用の関数を使用し、分割しないリストに追加
+        if file_extension == ".csv":
+            docs = load_csv_as_single_document(path)
+            csv_docs.extend(docs)
+        else:
+            # ファイルの拡張子に合ったdata loaderを使ってデータ読み込み
+            loader = ct.SUPPORTED_EXTENSIONS[file_extension](path)
+            docs = loader.load()
+            docs_all.extend(docs)
 
 
 def adjust_string(s):
